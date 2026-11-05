@@ -1,0 +1,146 @@
+---
+- name: Setup ART Build Failures resources in OpenShift
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    namespace: "{{ lookup('env', 'OPENSHIFT_NAMESPACE') }}"
+    redis_password: "{{ lookup('env', 'REDIS_PASSWORD') }}"
+    jira_email: "{{ lookup('env', 'JIRA_EMAIL') }}"
+    jira_token: "{{ lookup('env', 'JIRA_TOKEN') }}"
+    update_redis_secret: "{{ lookup('env', 'UPDATE_REDIS_SECRET') | default('false') }}"
+    update_jira_secret: "{{ lookup('env', 'UPDATE_JIRA_SECRET') | default('false') }}"
+
+  tasks:
+    # Validation
+    - name: Validate OPENSHIFT_NAMESPACE is set
+      ansible.builtin.fail:
+        msg: |
+          OPENSHIFT_NAMESPACE environment variable is not set
+
+          Please create or select a namespace first, then set:
+            export OPENSHIFT_NAMESPACE=your-namespace-name
+      when: namespace == ""
+
+    # Secrets (conditional based on available credentials)
+    - name: Create/Update redis-server-password secret
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: redis-server-password
+          type: Opaque
+          stringData:
+            password: "{{ redis_password }}"
+      when: update_redis_secret == "true"
+
+    - name: Check if redis-server-password secret exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: redis-server-password
+        namespace: "{{ namespace }}"
+      register: redis_secret_check
+      when: update_redis_secret == "false"
+
+    - name: Warn if Redis secret missing and credentials not provided
+      ansible.builtin.debug:
+        msg: |
+          WARNING: redis-server-password secret does not exist and REDIS_PASSWORD not provided
+          The deployment may not work without Redis credentials
+      when: update_redis_secret == "false" and (redis_secret_check.resources | length == 0)
+
+    - name: Create/Update jira-credentials secret
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: jira-credentials
+          type: Opaque
+          stringData:
+            email: "{{ jira_email }}"
+            token: "{{ jira_token }}"
+      when: update_jira_secret == "true"
+
+    - name: Check if jira-credentials secret exists
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Secret
+        name: jira-credentials
+        namespace: "{{ namespace }}"
+      register: jira_secret_check
+      when: update_jira_secret == "false"
+
+    - name: Warn if Jira secret missing and credentials not provided
+      ansible.builtin.debug:
+        msg: |
+          WARNING: jira-credentials secret does not exist and Jira credentials not provided
+          Jira integration will not be available
+      when: update_jira_secret == "false" and (jira_secret_check.resources | length == 0)
+
+    # ImageStream
+    - name: Create ImageStream
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../openshift/is.yaml"
+
+    # BuildConfigs
+    - name: Create base BuildConfig
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../openshift/buildconfig-base.yaml"
+
+    - name: Create app BuildConfig
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../openshift/buildconfig-app.yaml"
+
+    # Service
+    - name: Create Service
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../openshift/service.yaml"
+
+    # Route
+    - name: Create Route
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../openshift/route.yaml"
+
+    # DeploymentConfig
+    - name: Create DeploymentConfig
+      kubernetes.core.k8s:
+        state: present
+        namespace: "{{ namespace }}"
+        src: "{{ playbook_dir }}/../openshift/deploymentconfig.yaml"
+
+    - name: Setup complete
+      ansible.builtin.debug:
+        msg: |
+          Setup complete!
+
+          Resources created/updated in namespace: {{ namespace }}
+          - Secret: redis-server-password ({{ 'updated' if update_redis_secret == 'true' else 'using existing' }})
+          - Secret: jira-credentials ({{ 'updated' if update_jira_secret == 'true' else 'using existing' }})
+          - ImageStream: art-build-failures (tags: base, latest)
+          - BuildConfigs: art-build-failures-base, art-build-failures
+          - Service: art-build-failures
+          - Route: art-build-failures
+          - DeploymentConfig: art-build-failures
+
+          Next steps:
+            1. Build base image: ansible-playbook ansible/build-base.yaml
+            2. Build app image: ansible-playbook ansible/update.yaml
+
+          Or run both: ansible-playbook ansible/build-all.yaml
